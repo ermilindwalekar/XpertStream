@@ -1,0 +1,70 @@
+# ==============================================================================
+# XpertStream: Git Ignore Configuration
+# ==============================================================================
+
+# Build outputs & artifacts
+build/
+bin/
+lib/
+out/
+x64/
+x86/
+Debug/
+Release/
+
+# C++ / MSVC / CMake temporary and user files
+.vs/
+*.user
+*.suo
+*.VC.db
+*.opendb
+*.ipch
+*.ilk
+*.pdb
+*.obj
+*.lib
+*.exp
+*.exe
+CMakeUserPresets.json
+CMakeFiles/
+CMakeCache.txt
+
+# Python environments and bytecode
+.venv*/
+venv*/
+env*/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Model Weights & Compiled Graphs (NEVER commit large binaries or model weights)
+models/
+*.bin
+*.xml
+*.blob
+*.safetensors
+*.onnx
+*.pt
+*.pth
+cache_npu/
+openvino_cache/
+*.cl_cache
+
+# Secrets, Credentials & Local Tokens (Strictly protected)
+.env
+.env.*
+*.token
+*.key
+*.pem
+.huggingface/
+hf_token*
+
+# OS & IDE local files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
