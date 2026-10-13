@@ -1,105 +1,17 @@
 # XpertStream
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Standard: C++20](https://img.shields.io/badge/Standard-C%2B%2B20-green.svg)](https://en.cppreference.com/w/cpp/20)
-[![Target: Intel NPU](https://img.shields.io/badge/Target-Intel%20NPU%20(37xx%2F40xx%2F50xx)-orange.svg)](https://www.intel.com/)
+[![Target: Intel NPU](https://img.shields.io/badge/Target-Intel%20NPU%20%7C%20GPU%20%7C%20CPU-orange.svg)](https://www.intel.com/)
 
-**XpertStream** is a model-agnostic, agentic inference engine engineered in modern C++ (C++20) for local Intel Neural Processing Units (NPUs), targeting **NPU 37xx** (Meteor Lake / Arrow Lake), **NPU 40xx** (Lunar Lake), and next-generation unreleased architectures (Panther Lake / NPU 50xx).
-
-The engine is architected for maximum hardware throughput and determinism via compile-time static tensor shapes, zero CPU fallback, zero heap allocations on the hot path, stateful OpenVINO KV-cache tracking (`ReadValue`/`Assign`), overlapped asynchronous execution pipelines, and a fully decoupled code-first ReAct agent runtime.
-
----
-
-## Architecture Overview
+**XpertStream** runs local LLMs on Intel hardware (NPU, GPU, CPU) with OpenVINO GenAI and exposes them as a coding agent inside VS Code.
 
 ```mermaid
-graph TD
-    subgraph AgenticLayer [Decoupled Agentic Runtime]
-        User[User Query / App] --> ReActSM[ReAct State Machine]
-        ReActSM --> ToolReg[Sandboxed Tool Registry]
-        ToolReg --> SchemaValidator[JSON-Schema Validator]
-    end
-
-    subgraph SemanticBridge [Model-Agnostic Adapter Layer]
-        ReActSM -->|OpenAI Chat Arrays| Adapter[LLMModelAdapter]
-        Adapter -->|Structured Text / ToolCalls| ReActSM
-        Adapter -->|Tokenization / Prompt Format| TokenStream[Token Sequence]
-    end
-
-    subgraph MemoryLayer [Static Memory & Boundary Strategy]
-        ShapePlanner[Static Shape Planner] --> FixedPool[Fixed Tensor Buffer Pool]
-        StatefulTracker[Stateful KV-Cache Tracker] --> BoundCheck{Exceeds max_seq_len?}
-        BoundCheck -->|Yes| OverflowEx[SequenceOverflowException\nCPU Offload Strictly Disabled]
-        BoundCheck -->|No| SafeExecute[NPU Static Execution]
-    end
-
-    subgraph AsyncPipeline [Overlapped Hardware Execution]
-        SafeExecute --> AsyncReq[AsyncInferRequest Queue]
-        AsyncReq -->|Non-blocking NPU DPU Dispatch| IntelNPU[Intel NPU 37xx / 40xx / 50xx]
-        AsyncReq -->|Overlapped Host Execution| Sampler[Decoupled Token Sampler / Greed / Top-p]
-    end
-```
-
----
-
-## Core Architectural Pillars
-
-### 1. Model-Agnostic Adapter Interface
-The core engine contains **zero model-specific hardcoding** and **zero direct hardware dependencies**:
-- **Interface:** `xpertstream::LLMModelAdapter`
-- **Inputs:** Standard OpenAI-style `ChatMessage` sequences (`System`, `User`, `Assistant`, `Tool`).
-- **Outputs:** Structured `GenerationOutput` containing decoded text and/or strongly-typed `ToolCall` models.
-- **Role:** Handles prompt formatting (e.g. ChatML, Llama-3, Qwen) and token-stream parsing without leaking hardware runtimes into agent logic.
-
-### 2. Static Shape Memory Strategy
-Dynamic graph recompilations on Intel NPUs introduce latency spikes, compilation overhead, and unpredictable driver allocations:
-- **Batch Size:** Strictly locked to `1` (`StaticTensorShapeConfig::BATCH_SIZE = 1`).
-- **Decode Shape:** Locked to static single-token steps `[1, 1]` with position IDs `[1, 1]`.
-- **KV-Cache Paradigm:** Stateful graph execution leveraging OpenVINO `ReadValue` and `Assign` operators. Internal attention states reside directly in NPU memory across inference calls, eliminating multi-gigabyte PCIe/SoC transfers per token.
-- **Zero-Allocation Hot Path:** `FixedTensorBufferPool` pre-allocates contiguous memory at engine startup.
-
-### 3. Sequence Limit & Hard Exception Boundary
-- **Hard Bound:** Statically locked `max_seq_len` determined at graph compilation time.
-- **Zero CPU Offload:** Fallback to CPU execution or dynamic graph resizing is strictly rejected to preserve deterministic latency, thermal budgets, and predictable NPU residency.
-- **Failure Mode:** If prompt or cumulative autoregressive generation violates `max_seq_len`, the engine immediately throws `xpertstream::SequenceOverflowException` carrying comprehensive diagnostic telemetry:
-  - Current sequence tokens count
-  - Maximum statically allocated capacity
-  - Requested token increment
-  - Hardware target architecture
-  - Execution phase (`prefill` vs. `decode`)
-
-### 4. Overlapped Asynchronous Execution Pipeline
-- **Abstraction:** `xpertstream::AsyncInferencePipeline` wraps OpenVINO non-blocking `AsyncInferRequest` APIs.
-- **Decoupled Sampling:** NPU tensor matrix operations are decoupled from host-side token sampling.
-- **Double-Buffered Overlap:**
-  1. Token pass $N$ is dispatched asynchronously to the NPU queue (`start_async()`).
-  2. Host CPU concurrently samples logits of token $N-1$, evaluates repetition penalties, checks stop tokens, and constructs static input buffers for $N+1$.
-  3. Host synchronizes on $N$ completion (`wait()`), immediately launches $N+1$, and repeats.
-
-### 5. Decoupled Agent Execution Loop
-- **Interface:** `xpertstream::ReActStateMachine`
-- **Execution Loop:** Code-first Reasoning $\to$ Action Dispatch $\to$ Observation $\to$ Completion cycle.
-- **Isolation:** Operates via an abstract `InferenceInvoker` delegate; completely decoupled from OpenVINO, tensor math, or hardware headers.
-- **Tool Sandbox:** `xpertstream::ToolRegistry` and `xpertstream::ISandboxedTool` enforce strict JSON-Schema input validation prior to execution and output schema conformance upon return.
-
----
-
-## Quick Start: Build & Run
-
-### Prerequisites
-- CMake 3.22+
-- C++20 compliant compiler (MSVC 2022/2026, Clang 16+, GCC 12+)
-
-### Configure and Build
-```powershell
-# Generate CMake build directory
-cmake -B build -G "Visual Studio 18 2026" -A x64
-
-# Build Release binary
-cmake --build build --config Release
-
-# Run the architectural demo
-.\build\src\Release\demo_runner.exe
+graph LR
+    HF[Hugging Face model] -->|ExportNPUModel.cmd: INT4 + OpenVINO IR| Models[models/]
+    Models --> Server[AgentServer.cmd: OpenAI-compatible server]
+    Server --> Ext[VS Code extension]
+    Ext --> Participant["@xpert agent"]
+    Ext --> Picker[Copilot model picker / Agent mode]
 ```
 
 ---
@@ -164,8 +76,23 @@ Run one-off prompts with [RunNPU.cmd](RunNPU.cmd):
 RunNPU.cmd "Explain quantum computing in one sentence"
 ```
 
-### Step 4: C++ Architecture & Engine Interfaces
-The concrete C++ hardware backend in [include/xpertstream/runtime/openvino_npu_backend.hpp](include/xpertstream/runtime/openvino_npu_backend.hpp) compiles the model directly to the `"NPU"` execution device with static shape locking (`[1, 1]` decode, `[1, max_seq_len]` attention mask) and zero CPU fallback.
+### Step 4: Agent Mode in VS Code Chat (`@xpert`)
+The model can act as a coding agent on a workspace through a VS Code chat participant:
+
+- [scripts/agent_server.py](scripts/agent_server.py): local OpenAI-compatible `/v1/chat/completions` server (localhost only) with Qwen `<tool_call>` parsing. The NPU pipeline is compiled with a static prompt budget (`--max-prompt-len`, default 4096) and response budget (`--max-response-len`, default 1024); oversized prompts return `context_length_exceeded`.
+- [vscode-xpert/](vscode-xpert/): the `@xpert` chat participant. It runs the agent loop with five tools (`list_files`, `read_file`, `search_text`, `replace_in_file`, `write_file`) confined to the open workspace, and drops old tool output when the NPU context fills up.
+- [demo-project/](demo-project/): a 10-file Python to-do app to try the agent on (open it as its own VS Code folder).
+
+```bat
+:: 1. Start the server. It also installs/updates the @xpert VS Code extension when needed.
+::    (First NPU compile with new budgets takes several minutes; cached afterwards.)
+AgentServer.cmd
+AgentServer.cmd --device GPU --max-prompt-len 16384
+
+:: 2. Reload VS Code, open any project folder, open Chat, then type e.g.
+::    @xpert add a clear-done command that removes completed tasks
+::    or pick "XpertStream (local)" in the model picker.
+```
 
 ---
 
@@ -173,30 +100,19 @@ The concrete C++ hardware backend in [include/xpertstream/runtime/openvino_npu_b
 
 ```
 c:\XpertStream\
-├── CMakeLists.txt                        # Root CMake configuration (C++20, strict warnings)
-├── README.md                             # Architecture blueprint & documentation
-├── include/
-│   └── xpertstream/
-│       ├── common/
-│       │   ├── types.hpp                 # ChatMessage, ToolCall, GenerationOutput, TargetNPUArch
-│       │   └── exceptions.hpp            # SequenceOverflowException, StaticShapeViolationException
-│       ├── adapter/
-│       │   ├── model_metadata.hpp        # Vocab, heads, layers, special tokens metadata
-│       │   ├── tool_definition.hpp       # JSON-Schema tool parameters definition
-│       │   └── llm_model_adapter.hpp     # Abstract LLMModelAdapter base class
-│       ├── memory/
-│       │   ├── static_tensor_desc.hpp    # Static tensor shape locking configuration
-│       │   ├── fixed_tensor_buffer.hpp   # Pre-allocated zero-heap tensor buffers
-│       │   └── stateful_kv_cache_tracker.hpp # ReadValue/Assign KV-cache tracker & boundary guard
-│       ├── runtime/
-│       │   ├── sampler.hpp               # Host-side decoupled token sampler
-│       │   ├── npu_backend.hpp           # Hardware abstraction barrier for OpenVINO runtime
-│       │   └── async_infer_pipeline.hpp  # Overlapped non-blocking AsyncInferRequest pipeline
-│       ├── agent/
-│       │   ├── tool_sandbox.hpp          # Sandboxed tool interface & JSON-Schema registry
-│       │   └── react_state_machine.hpp   # Code-first ReAct state machine
-│       └── engine.hpp                    # Top-level orchestration interface
-└── src/
-    ├── CMakeLists.txt                    # Interface library & smoke test target
-    └── interface_smoke_test.cpp          # C++20 static assertions and signature validation
+├── ExportNPUModel.cmd            # Download from Hugging Face, INT4-quantize, export to OpenVINO IR
+├── Chat.cmd                      # Interactive terminal chat
+├── RunNPU.cmd                    # Single-shot prompt
+├── AgentServer.cmd               # OpenAI-compatible server for VS Code
+├── requirements-npu.txt
+├── scripts/
+│   ├── export_npu_model.py
+│   ├── chat_terminal.py
+│   ├── run_npu_genai.py
+│   ├── run_npu_inference.py
+│   ├── agent_server.py
+│   └── install_vscode_extension.py   # Packages and installs vscode-xpert (no Node.js needed)
+├── vscode-xpert/                 # VS Code extension: @xpert agent + model-picker provider
+├── demo-project/                 # Small Python to-do app for trying the agent
+└── models/                       # Exported models (gitignored)
 ```
