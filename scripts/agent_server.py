@@ -1,9 +1,9 @@
 """
 XpertStream: Local OpenAI-Compatible Agent Server
 =================================================
-Serves an exported OpenVINO model (default: Qwen2.5-Coder-7B on NPU) behind a minimal
-OpenAI-compatible `/v1/chat/completions` endpoint with tool-calling support, so the
-XpertStream VS Code chat participant (or any OpenAI-compatible client) can drive it.
+Serves an exported OpenVINO model (default: Qwen2.5-Coder-7B on NPU) behind a local
+OpenAI-compatible `/v1/chat/completions` endpoint. Agent frameworks use this API;
+model profiles adapt each model family's tool-call format.
 
 The NPU compiles static shapes, so the prompt budget (MAX_PROMPT_LEN) and the response
 budget (MIN_RESPONSE_LEN) are fixed when the pipeline is created. Requests whose prompt
@@ -12,7 +12,6 @@ exceeds the budget are rejected with `context_length_exceeded` so the client can
 
 import argparse
 import json
-import re
 import socket
 import sys
 import threading
@@ -21,10 +20,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from configure_opencode import register_global_config
+from inference_backend import create_pipeline
+from model_profiles import available_profiles, select_profile
+
 MAX_BODY_BYTES = 4 * 1024 * 1024
-TOOL_OPEN = "<tool_call>"
-TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)", re.S)
-FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 
 
 def resolve_model_path(args) -> Path:
@@ -77,46 +77,6 @@ def to_template_messages(messages):
     return out
 
 
-def parse_tool_calls(text: str, tool_names: set):
-    """Extract Qwen/Hermes-style <tool_call> blocks; fall back to fenced JSON naming a known tool."""
-    matches = list(TOOL_BLOCK_RE.finditer(text))
-    if not matches and tool_names:
-        matches = list(FENCED_JSON_RE.finditer(text))
-    raw_calls = [m.group(1) for m in matches]
-    cut = matches[0].start() if matches else len(text)
-    stripped = text.strip()
-    if not raw_calls and tool_names and stripped.startswith("{") and stripped.endswith("}"):
-        raw_calls, cut = [stripped], 0
-
-    calls = []
-    for raw in raw_calls:
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        name = obj.get("name") if isinstance(obj, dict) else None
-        if not name or (tool_names and name not in tool_names):
-            continue
-        arguments = obj.get("arguments", obj.get("parameters", {}))
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments, ensure_ascii=False)
-        calls.append({
-            "id": f"call_{uuid.uuid4().hex[:12]}",
-            "type": "function",
-            "function": {"name": name, "arguments": arguments},
-        })
-    content = text[:cut].strip() if calls else text.strip()
-    return content, calls
-
-
-def held_back_length(text: str, marker: str) -> int:
-    """Length of the longest suffix of `text` that could be the start of `marker`."""
-    for n in range(min(len(marker) - 1, len(text)), 0, -1):
-        if marker.startswith(text[-n:]):
-            return n
-    return 0
-
-
 class ModelHost:
     def __init__(self, args):
         import openvino_genai as og
@@ -132,36 +92,48 @@ class ModelHost:
         self.device = args.device
         self.max_prompt_len = args.max_prompt_len
         self.max_response_len = args.max_response_len
+        self.log_output = args.log_output
         self.lock = threading.Lock()
         self.last_error = None
 
         print(f"[*] Model:   {self.model_path}")
         print(f"[*] Device:  {self.device}  (prompt budget {self.max_prompt_len}, response budget {self.max_response_len})")
         self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path))
+        self.profile = select_profile(self.model_path, self.tokenizer.chat_template, args.profile)
+        print(f"[*] Profile: {self.profile.name}  ({self.profile.description})")
 
         t0 = time.perf_counter()
-        if self.device == "NPU":
-            cache_dir = self.model_path / "cache_npu"
-            cache_dir.mkdir(exist_ok=True)
-            self.pipe = og.LLMPipeline(
-                str(self.model_path), "NPU",
-                CACHE_DIR=str(cache_dir),
-                MAX_PROMPT_LEN=self.max_prompt_len,
-                MIN_RESPONSE_LEN=self.max_response_len,
-            )
-        else:
-            self.pipe = og.LLMPipeline(str(self.model_path), self.device)
+        self.pipe = create_pipeline(og, self.model_path, self.device, self.max_prompt_len, self.max_response_len)
         print(f"[+] Pipeline ready in {time.perf_counter() - t0:.1f}s")
+        self.check_tokenizer()
+
+    def check_tokenizer(self):
+        ov_tokenizer = self.pipe.get_tokenizer()
+        try:
+            warnings = self.profile.check_detokenizer(
+                ov_tokenizer.decode, lambda s: ov_tokenizer.encode(s).input_ids.data.tolist()[0])
+        except Exception as e:
+            warnings = [f"Could not verify the detokenizer: {e}"]
+        for w in warnings:
+            print(f"[WARN] {w}")
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenizer(text, add_special_tokens=False).input_ids)
 
     def build_prompt(self, messages, tools):
+        msgs = self.profile.prepare_messages(to_template_messages(messages))
+        if tools:
+            rules = self.profile.tool_rules()
+            if msgs and msgs[0]["role"] == "system":
+                msgs[0] = {**msgs[0], "content": f"{msgs[0]['content']}\n\n{rules}"}
+            else:
+                msgs.insert(0, {"role": "system", "content": rules})
         return self.tokenizer.apply_chat_template(
-            to_template_messages(messages),
+            msgs,
             tools=tools or None,
             tokenize=False,
             add_generation_prompt=True,
+            **self.profile.chat_template_kwargs(),
         )
 
     def make_config(self, body, prompt_tokens):
@@ -170,11 +142,13 @@ class ModelHost:
         budget = self.max_prompt_len + self.max_response_len - prompt_tokens
         requested = body.get("max_tokens") or body.get("max_completion_tokens") or self.max_response_len
         cfg.max_new_tokens = max(1, min(int(requested), budget))
-        temperature = float(body.get("temperature") or 0.0)
+        defaults = self.profile.generation_defaults()
+        temperature = float(body.get("temperature") if body.get("temperature") is not None
+                             else defaults["temperature"])
         if temperature > 0:
             cfg.do_sample = True
             cfg.temperature = temperature
-            cfg.top_p = float(body.get("top_p") or 0.95)
+            cfg.top_p = float(body.get("top_p") if body.get("top_p") is not None else defaults["top_p"])
         else:
             cfg.do_sample = False
         return cfg
@@ -212,10 +186,20 @@ class ExclusiveHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
+    def handle_error(self, request, client_address):
+        # Clients that time out or cancel (e.g. health checks during model load) are not server errors.
+        if isinstance(sys.exc_info()[1], (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
 
 class Handler(BaseHTTPRequestHandler):
     host: ModelHost = None
     server_version = "XpertStream/0.1"
+
+    def setup(self):
+        super().setup()
+        self.write_lock = threading.Lock()
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[http] {self.address_string()} {fmt % args}\n")
@@ -235,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/health", "/v1/health"):
             self.send_json(200, {
                 "status": "error" if self.host.last_error else "ok", "error": self.host.last_error,
-                "model": self.host.model_name, "device": self.host.device,
+                "model": self.host.model_name, "device": self.host.device, "profile": self.host.profile.name,
                 "max_prompt_len": self.host.max_prompt_len, "max_response_len": self.host.max_response_len,
             })
         elif self.path == "/v1/models":
@@ -293,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.perf_counter()
 
         if body.get("stream"):
-            text = self.stream_completion(prompt, cfg, completion_id, created, tool_names)
+            text, emitted = self.stream_completion(prompt, cfg, completion_id, created, tool_names)
         else:
             try:
                 text = self.host.generate(prompt, cfg, None)
@@ -304,18 +288,24 @@ class Handler(BaseHTTPRequestHandler):
         if text is None:
             return  # client disconnected or error already reported
 
-        content, calls = parse_tool_calls(text, tool_names)
+        reply = self.host.profile.parse(text, tool_names)
+        content, calls = reply.content, reply.tool_calls
         completion_tokens = self.host.count_tokens(text)
         finish = "tool_calls" if calls else ("length" if completion_tokens >= cfg.max_new_tokens else "stop")
         elapsed = time.perf_counter() - t0
         print(f"[gen] prompt={prompt_tokens} completion={completion_tokens} tools={len(calls)} "
               f"{elapsed:.1f}s ({completion_tokens / max(elapsed, 1e-6):.1f} tok/s)")
+        if self.host.log_output:
+            print(f"[out] offered {len(tool_names)} tools; raw model output:\n{text}\n[/out]")
 
         usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                  "total_tokens": prompt_tokens + completion_tokens}
 
         if body.get("stream"):
             try:
+                # Text withheld as a possible tool call that wasn't one still belongs to the reply.
+                if not calls and emitted < len(text):
+                    self.write_chunk(completion_id, created, {"content": text[emitted:]})
                 if calls:
                     self.write_chunk(completion_id, created, {"tool_calls": [
                         {"index": i, **c} for i, c in enumerate(calls)]})
@@ -342,11 +332,16 @@ class Handler(BaseHTTPRequestHandler):
         }
         if usage:
             chunk["usage"] = usage
-        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
-        self.wfile.flush()
+        self.write_raw(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+
+    def write_raw(self, data: bytes):
+        with self.write_lock:
+            self.wfile.write(data)
+            self.wfile.flush()
 
     def stream_completion(self, prompt, cfg, completion_id, created, tool_names):
-        """Streams plain-text deltas; text from the first <tool_call> onward is withheld and parsed at the end."""
+        """Streams plain-text deltas; text from where the profile detects a tool call is withheld and parsed at the end."""
+        profile = self.host.profile
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -355,16 +350,18 @@ class Handler(BaseHTTPRequestHandler):
         state = {"buf": "", "emitted": 0, "in_tool": False, "disconnected": False}
 
         def on_text(subword):
+            if state["disconnected"]:
+                return True
             state["buf"] += subword
             if state["in_tool"]:
                 return False
             buf = state["buf"]
-            idx = buf.find(TOOL_OPEN, state["emitted"])
-            if idx >= 0:
+            idx = profile.tool_call_start(buf)
+            if idx is not None:
                 state["in_tool"] = True
                 end = idx
             else:
-                end = len(buf) - held_back_length(buf, TOOL_OPEN)
+                end = len(buf) - profile.holdback(buf)
             if end > state["emitted"]:
                 piece = buf[state["emitted"]:end]
                 state["emitted"] = end
@@ -375,39 +372,51 @@ class Handler(BaseHTTPRequestHandler):
                     return True
             return False
 
+        # Long prompts can take minutes to prefill; SSE comments keep idle-timeout clients (Node fetch: 300s) alive.
+        done = threading.Event()
+
+        def heartbeat():
+            while not done.wait(10):
+                try:
+                    self.write_raw(b": keepalive\n\n")
+                except OSError:
+                    state["disconnected"] = True
+                    return
+
+        threading.Thread(target=heartbeat, daemon=True).start()
         try:
             self.write_chunk(completion_id, created, {"role": "assistant", "content": ""})
             text = self.host.generate(prompt, cfg, on_text)
         except OSError:
-            return None
+            return None, 0
         except Exception as e:
             error = {"message": f"Generation failed: {self.host.last_error or e}", "type": "server_error",
                      "code": "generation_failed"}
             try:
-                self.wfile.write(f"data: {json.dumps({'error': error})}\n\ndata: [DONE]\n\n".encode("utf-8"))
-                self.wfile.flush()
+                self.write_raw(f"data: {json.dumps({'error': error})}\n\ndata: [DONE]\n\n".encode("utf-8"))
             except OSError:
                 pass
-            return None
+            return None, 0
+        finally:
+            done.set()
         if state["disconnected"]:
-            return None
-        if not state["in_tool"] and state["emitted"] < len(text):
-            try:
-                self.write_chunk(completion_id, created, {"content": text[state["emitted"]:]})
-            except OSError:
-                return None
-        return text
+            return None, 0
+        return text, state["emitted"]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="XpertStream local OpenAI-compatible agent server")
-    parser.add_argument("--device", "-d", choices=["NPU", "GPU", "CPU"], default="NPU")
+    parser = argparse.ArgumentParser(description="XpertStream local OpenVINO model server")
+    parser.add_argument("--device", "-d", choices=["NPU", "GPU", "GPU.0", "CPU"], default="NPU")
     parser.add_argument("--model", type=str, default=None, help="Model folder name under ./models or a path")
     parser.add_argument("--model-dir", "-m", default=None, help="Path to exported OpenVINO model")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (keep on localhost)")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--max-prompt-len", type=int, default=4096, help="Static NPU prompt budget (MAX_PROMPT_LEN)")
     parser.add_argument("--max-response-len", type=int, default=1024, help="Static NPU response budget (MIN_RESPONSE_LEN)")
+    parser.add_argument("--log-output", action="store_true", help="Print raw model output for each request (debugging)")
+    parser.add_argument("--profile", choices=sorted(available_profiles()), default=None,
+                        help="Model profile (tool-call format); auto-detected from the model by default")
+    parser.add_argument("--register-opencode", action="store_true", help="Register the loaded model for OpenCode's VS Code extension")
     args = parser.parse_args()
 
     try:
@@ -416,8 +425,13 @@ def main():
         print(f"[ERROR] Port {args.port} is already in use ({e}). Stop the other agent server or pass --port.")
         sys.exit(1)
     Handler.host = ModelHost(args)
-    print(f"[+] XpertStream agent server listening on http://{args.host}:{args.port}/v1")
-    print("    Open VS Code chat and talk to @xpert. Ctrl+C to stop.")
+    if args.register_opencode:
+        register_global_config(
+            {"status": "ok", "device": args.device, "max_prompt_len": args.max_prompt_len,
+             "max_response_len": args.max_response_len},
+            Handler.host.model_name, f"http://{args.host}:{args.port}")
+    print(f"[+] XpertStream model server listening on http://{args.host}:{args.port}/v1")
+    print("    Run OpenCode.cmd from the project you want to work on. Ctrl+C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

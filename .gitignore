@@ -41,6 +41,6 @@ hf_token*
 Thumbs.db
 desktop.ini
 .vscode/*
-!.vscode/launch.json
 *.vsix
 demo-project/tasks.json
+.opencode-xpert.json

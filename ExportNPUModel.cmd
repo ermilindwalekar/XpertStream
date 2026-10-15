@@ -34,10 +34,6 @@ cd /d "%~dp0"
 
 set "RUN_ARGS=%*"
 
-set "WANTS_HELP=0"
-echo %* | findstr /I /C:"--help" /C:"-h" >nul
-if not errorlevel 1 set "WANTS_HELP=1"
-
 set "DO_LOGIN=0"
 set "USER_TOKEN="
 set "EXPECT_TOKEN=0"
@@ -60,7 +56,6 @@ echo   XpertStream: Intel NPU Static-Shape Model Exporter Launcher
 echo ===================================================================
 
 rem 1. Check for Python launcher or python executable
-set "PYTHON_EXE="
 where py >nul 2>&1
 if not errorlevel 1 (
   set "PYTHON_LAUNCHER=py -3"
@@ -122,7 +117,8 @@ if "!DO_LOGIN!"=="1" (
     set /p "USER_TOKEN=Paste your Hugging Face Token (hf_...): "
   )
   if not "!USER_TOKEN!"=="" (
-    python -c "import huggingface_hub; huggingface_hub.login(token='!USER_TOKEN!', add_to_git_credential=False)"
+    set "HF_TOKEN=!USER_TOKEN!"
+    python -c "import os, huggingface_hub; huggingface_hub.login(token=os.environ['HF_TOKEN'], add_to_git_credential=False)"
     if not errorlevel 1 (
       echo.
       echo [ExportNPUModel] [SUCCESS] Token saved to Hugging Face credential cache!
@@ -153,7 +149,11 @@ echo [ExportNPUModel] Executing model export with arguments:
 if "%RUN_ARGS%"=="" (
   echo [ExportNPUModel]   (Using default model and settings)
 ) else (
-  echo [ExportNPUModel]   !RUN_ARGS!
+  if defined USER_TOKEN (
+    echo [ExportNPUModel]   Arguments include a token - hidden
+  ) else (
+    echo [ExportNPUModel]   !RUN_ARGS!
+  )
 )
 echo.
 

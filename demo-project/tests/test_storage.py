@@ -6,6 +6,7 @@ from taskr.models import Task
 from taskr.storage import JsonStorage
 
 
+# Tests JSON storage defaults, round trips, and task validation.
 class JsonStorageTests(unittest.TestCase):
     def test_missing_file_loads_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

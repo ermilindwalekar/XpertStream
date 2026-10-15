@@ -1,13 +1,13 @@
 @echo off
 :::
-::: AgentServer - Local OpenAI-compatible agent server for the @xpert VS Code chat participant
+::: AgentServer - Local OpenVINO model server for OpenCode and other compatible clients
 ::: ==========================================================================================
 :::
 ::: QUICK START:
 :::   AgentServer.cmd                         (Qwen2.5-Coder-7B on NPU, http://127.0.0.1:8765)
 :::
 ::: OPTIONS:
-:::   AgentServer.cmd --device GPU
+:::   AgentServer.cmd --device GPU.0
 :::   AgentServer.cmd --max-prompt-len 8192 --max-response-len 1024
 :::   AgentServer.cmd --model qwen2.5-npu --port 8765
 :::
@@ -30,12 +30,7 @@ if errorlevel 1 (
   python -m pip install -r requirements-npu.txt
 )
 
-python scripts\install_vscode_extension.py
-if errorlevel 1 (
-  echo [AgentServer] [WARN] Could not install the VS Code extension; the server will still start.
-)
-
-python scripts\agent_server.py %*
+python scripts\agent_server.py --register-opencode %*
 set EXIT_CODE=%errorlevel%
 
 exit /b %EXIT_CODE%

@@ -6,6 +6,7 @@ from taskr.service import TaskNotFound, TaskService
 from taskr.storage import JsonStorage
 
 
+# Tests task creation, completion, listing, and missing-task handling.
 class TaskServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

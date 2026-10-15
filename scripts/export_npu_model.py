@@ -32,6 +32,16 @@ MODEL_PRESETS = {
         "default_dir": "./models/qwen2.5-coder-1.5b-npu",
         "description": "Fast lightweight coding model (INT4 ~1.2GB, ideal for Meteor Lake NPU 3720)"
     },
+    "qwen3-8b": {
+        "model_id": "Qwen/Qwen3-8B",
+        "default_dir": "./models/qwen3-8b-npu",
+        "description": "Apache-2.0 Qwen3 8B agent/tool-calling baseline"
+    },
+    "qwen3-30b-a3b": {
+        "model_id": "Qwen/Qwen3-30B-A3B",
+        "default_dir": "./models/qwen3-30b-a3b-npu",
+        "description": "Apache-2.0 Qwen3 30B MoE (3B active); INT4 GPU trial"
+    },
     "qwen-0.5b": {
         "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
         "default_dir": "./models/qwen2.5-npu",
@@ -95,12 +105,12 @@ def export_model_for_npu(
     if res.returncode != 0:
         print(f"\n[ERROR] Model export failed with exit code {res.returncode}")
         print("\n-------------------------------------------------------------------")
-        print("[!] Troubleshooting 401 Unauthorized or Gated Model access:")
-        print(f"  1. Ensure you have accepted the user agreement at https://huggingface.co/{model_id}")
-        print("  2. Authenticate using your Hugging Face Access Token:")
-        print("     - Run: ExportNPUModel.cmd --login")
-        print("     - Or pass: ExportNPUModel.cmd --token \"hf_...\"")
-        print("     - Or set: $env:HF_TOKEN = \"hf_...\" (PowerShell) / set HF_TOKEN=hf_... (CMD)")
+        if res.returncode & 0xFFFFFFFF == 0xC0000005:
+            print("[!] Windows access violation (0xC0000005) in the export process, not an authentication error.")
+            print("    Check Windows Event Viewer > Windows Logs > Application for the faulting module.")
+            print("    Large-model conversion may require substantial RAM/pagefile space; a native library crash is also possible.")
+        else:
+            print("[!] See the Optimum output above for the cause. If it reports 401/403, check model access and authentication.")
         print("-------------------------------------------------------------------\n")
         sys.exit(res.returncode)
 
@@ -125,11 +135,28 @@ def export_model_for_npu(
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(config_data, f, indent=2)
 
+    rebuild_detokenizer(out_path)
+
     print("\n-------------------------------------------------------------------")
     print(f"[+] Successfully exported static-shape model for Intel NPU!")
     print(f"    - Output Folder:  {out_path}")
     print(f"    - Metadata JSON:  {config_file}")
     print("===================================================================")
+
+def rebuild_detokenizer(model_dir: Path):
+    """Regenerates openvino_detokenizer.xml without clean_up_tokenization_spaces.
+
+    Some tokenizers (e.g. Llama 3.1) enable it, which turns `from .models` into `from.models` and corrupts code.
+    """
+    import openvino as ov
+    from openvino_tokenizers import convert_tokenizer
+    from transformers import AutoTokenizer
+
+    hf_tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    _, detokenizer = convert_tokenizer(hf_tokenizer, with_detokenizer=True, clean_up_tokenization_spaces=False)
+    ov.save_model(detokenizer, str(model_dir / "openvino_detokenizer.xml"))
+    print(f"[+] Rebuilt detokenizer without tokenization-space clean-up: {model_dir / 'openvino_detokenizer.xml'}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -180,7 +207,17 @@ if __name__ == "__main__":
         dest="token",
         help="Hugging Face user access token (hf_...) for gated models or private repos"
     )
+    parser.add_argument(
+        "--fix-detokenizer",
+        metavar="MODEL_DIR",
+        default=None,
+        help="Only rebuild the detokenizer of an already-exported model (fixes code like 'from.models')"
+    )
     args = parser.parse_args()
+
+    if args.fix_detokenizer:
+        rebuild_detokenizer(Path(args.fix_detokenizer).resolve())
+        sys.exit(0)
 
     # Resolve preset or model ID
     selected_model_id = args.model_id
